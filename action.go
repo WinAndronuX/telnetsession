@@ -27,6 +27,8 @@ type Action interface {
 	GetText() (string, error)
 	// GetPrompt returns the prompt character to wait for after sending text
 	GetPrompt() string
+	// SetPrompr
+	SetPrompt(prompt string)
 	// GetOnSuccessFunc returns the callback function to execute on success
 	GetOnSuccessFunc() OnSuccessFunc
 }
@@ -50,6 +52,10 @@ func (e *ExpectAction) GetText() (string, error) {
 // GetPrompt returns an empty string as ExpectAction doesn't use prompts
 func (e *ExpectAction) GetPrompt() string {
 	return ""
+}
+
+func (e *ExpectAction) SetPrompt(_ string) {
+
 }
 
 // GetOnSuccessFunc returns the success callback function
@@ -83,6 +89,10 @@ func (s *SendAction) GetText() (string, error) {
 // GetPrompt returns the prompt character to wait for after sending text
 func (s *SendAction) GetPrompt() string {
 	return s.prompt
+}
+
+func (s *SendAction) SetPrompt(prompt string) {
+	s.prompt = prompt
 }
 
 // GetOnSuccessFunc returns the success callback function

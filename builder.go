@@ -117,6 +117,25 @@ func (s *SessionBuilder) SendTemplAndDo(text string, data map[string]any, onSucc
 	return s
 }
 
+func (s *SessionBuilder) Confirm(prompt, message string) *SessionBuilder {
+
+	if len(s.actions) == 0 || s.actions[len(s.actions)-1].GetType() != ActionSend {
+		s.errors = append(s.errors, errors.New("confirm action requires a pre send action"))
+		return s
+	}
+
+	s.actions[len(s.actions)-1].SetPrompt(prompt)
+
+	templ, err := template.New("").Parse(message)
+	if err != nil {
+		s.errors = append(s.errors, err)
+	}
+
+	s.actions = append(s.actions, &SendAction{templ: templ, data: nil, prompt: s.prompt, onSuccessFunc: nil})
+
+	return s
+}
+
 // Build creates a Session instance from the builder configuration
 // Returns an error if any template parsing errors occurred during building
 func (s *SessionBuilder) Build() (*Session, error) {
