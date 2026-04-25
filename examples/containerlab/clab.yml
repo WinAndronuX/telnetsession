@@ -1,0 +1,22 @@
+name: telnet-lab
+
+mgmt:
+  network: clab_mgmt
+  ipv4-subnet: 172.30.30.0/24
+
+topology:
+  nodes:
+    switch1:
+      kind: linux
+      image: alpine:latest
+      exec:
+        - apk add --no-cache busybox-extras
+        - adduser -D admin
+        - echo "admin:password123" | chpasswd
+        - "telnetd -p 23 -l /bin/sh" # Lanza shell directa sin login
+    switch2:
+      kind: linux
+      image: alpine:latest
+      exec:
+        - apk add --no-cache busybox-extras
+        - "telnetd -p 23 -l /bin/sh"

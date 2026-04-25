@@ -1,31 +1,24 @@
 # telnetsession
 
+[![Go Version](https://img.shields.io/badge/Go-1.23+-blue.svg)](https://golang.org)
+[![Version](https://img.shields.io/badge/version-v0.2.0-green.svg)](https://github.com/WinAndronuX/telnetsession/releases/tag/v0.2.0)
+
 ---
 
-El paquete `telnetsession` proporciona una interfaz para crear y ejecutar sesiones telnet en dispositivos remotos.
+El paquete `telnetsession` proporciona una interfaz robusta para automatizar sesiones Telnet en dispositivos remotos como OLTs (Huawei, VSOL, Nokia, TP-Link), switches y routers.
 
-### ¿Qué es una `session`?
+Utiliza un **Patrón Builder Fluido** para definir una secuencia de acciones antes de la ejecución, ofreciendo control preciso y características modernas de Go.
 
-A diferencia de otros paquetes telnet, con `telnetsession` debes definir una `session` utilizando 
-```telnetsession.NewBuilder()```. En esta configuración puedes especificar parámetros como timeout, 
-carácter de Enter, prompt, entre otros. Además, debes declarar las acciones a ejecutar usando `Send()`, 
-`Expect()` y sus variantes.
+## Características Principales
 
-Una vez que hayas declarado todas las acciones en una `session`, puedes ejecutarla. Este enfoque te 
-proporciona un control más preciso al enviar comandos y manejar las respuestas, además de ofrecer 
-un mejor manejo de errores.
-
-Una característica destacada es la capacidad de enviar plantillas (https://pkg.go.dev/text/template) 
-y utilizar datos dinámicos para generar comandos de forma programática.
-
-## Características
-
-- **Sistema de acciones fluido** para enviar comandos y esperar respuestas
-- **Soporte para plantillas** que permite generar comandos dinámicamente
-- **Callbacks de éxito** para procesar respuestas automáticamente
-- **Manejo de login** integrado con username y password
-- **Timeouts configurables** para conexión, lectura y escritura
-- **Interfaz builder** para una configuración fluida y legible
+- **Arquitectura FSM**: Máquina de Estados Finita confiable para la gestión del ciclo de vida de la conexión.
+- **Potencia de Regex**: Uso de expresiones regulares para prompts, disparadores de login y respuestas esperadas.
+- **Paginación Automática**: Manejo de prompts estilo `--More--` en tiempo real.
+- **Detección de Errores Fail-Fast**: Aborta la sesión inmediatamente al detectar errores del dispositivo.
+- **Go Moderno**: Soporte completo para `context.Context` (cancelación/timeouts) y errores tipificados.
+- **Protocolo Robusto**: Filtrado automático de Telnet IAC y limpieza de códigos ANSI (colores).
+- **Plantillas**: Generación dinámica de comandos usando `text/template`.
+- **Acciones Pre-Login**: Soporte para dispositivos excéntricos (como Nokia TL1) que requieren interacción antes del login.
 
 ## Instalación
 
@@ -35,8 +28,6 @@ go get github.com/WinAndronuX/telnetsession
 
 ## Uso Básico
 
-### Ejemplo Simple
-
 ```go
 package main
 
@@ -44,199 +35,80 @@ import (
     "fmt"
     "log"
     "time"
-    
     "github.com/WinAndronuX/telnetsession"
 )
 
 func main() {
-    // Configurar la sesión
-    session, err := telnetsession.NewBuilder().
+    session, _ := telnetsession.NewBuilder().
         WithTimeout(5 * time.Second).
-        SetEnter("\n").
         SetLoginExpr("Login:", "Password:").
-        SetPrompt(">").
+        SetPrompt(`[>#]`). // Regex para prompts comunes
+        WithPagination(`--More--`, " ").
+        WithErrors(`Invalid command`, `Permission denied`).
         Send("show version").
         Build()
     
-    if err != nil {
-        log.Fatal(err)
-    }
-    
-    // Crear y ejecutar la sesión
     device := telnetsession.New(session)
-    
     if err := device.Run("192.168.1.1", 23, "admin", "password"); err != nil {
         log.Fatal(err)
     }
     
-    // Obtener la salida
     fmt.Println(device.GetOutput())
 }
 ```
 
-### Ejemplo con Callbacks
+## Características Avanzadas
 
+### Modo Privilegiado (Cisco)
 ```go
-session, err := telnetsession.NewBuilder().
-    WithTimeout(5 * time.Second).
-    SetEnter("\n").
-    SetLoginExpr("Login:", "Password:").
+session, _ := builder.
     SetPrompt(">").
-    Send("enable").
+    Enable("privileged_password").
     SetPrompt("#").
-    Expect("Password:").
-    Send("enable_password").
-    SendAndDo("show version", func(output string) error {
-        fmt.Println("Versión del dispositivo:", output)
-        return nil
-    }).
+    Send("show running-config").
     Build()
 ```
 
-### Ejemplo con Plantillas
-
+### Pre-Login (Estilo Nokia TL1)
 ```go
-data := map[string]any{
-    "interfaces": []string{"eth0", "eth1", "eth2"},
-}
+session, _ := builder.
+    SendInitial("T").      // Enviar 'T' para seleccionar modo
+    ExpectInitial("sure?").
+    SendInitial("y").      // Confirmar
+    SetLoginExpr("User:", "Pass:").
+    Build()
+```
 
-session, err := telnetsession.NewBuilder().
-    WithTimeout(5 * time.Second).
-    SetEnter("\n").
-    SetLoginExpr("Login:", "Password:").
-    SetPrompt(">").
-    SendTempl(`
-{{ range .interfaces }}
-interface {{ . }}
-show interface
-exit
-{{ end }}`, data).
+### Callbacks y Plantillas
+```go
+data := map[string]any{"vlan": 100}
+session, _ := builder.
+    SendTempl("display vlan {{.vlan}}", data).
+    SendAndDo("display current-configuration", func(output string) error {
+        // Procesar salida aquí
+        return nil
+    }).
     Build()
 ```
 
 ## API Reference
 
 ### SessionBuilder
-
-El `SessionBuilder` proporciona una interfaz fluida para configurar sesiones telnet.
-
-#### Métodos de Configuración
-
-- `WithTimeout(duration)` - Establece el timeout de conexión
-- `WithReadTimeout(duration)` - Establece el timeout de lectura
-- `WithWriteTimeout(duration)` - Establece el timeout de escritura
-- `SetEnter(string)` - Establece el carácter de fin de línea
-- `SetPrompt(string)` - Establece el carácter de prompt
-- `SetLoginExpr(username, password)` - Establece las expresiones de login
-
-#### Métodos de Acciones
-
-- `Send(text)` - Envía texto al dispositivo
-- `SendAndDo(text, callback)` - Envía texto y ejecuta un callback para procesar la respuesta
-- `SendTempl(template, data)` - Envía una plantilla
-- `SendTemplAndDo(template, data, callback)` - Envía una plantilla y ejecuta un callback para procesar la respuesta
-- `Expect(text)` - Espera que aparezca un texto específico
-- `ExpectAndDo(text, callback)` - Espera un texto específico y ejecuta un callback para procesar la respuesta
+- `WithTimeout / WithReadTimeout / WithWriteTimeout`: Control de tiempos.
+- `SetPrompt(regex)`: Establece el prompt esperado.
+- `SetLoginExpr(user, pass)`: Configura expresiones de login.
+- `WithPagination(pattern, response)`: Manejo de paginación.
+- `WithErrors(patterns...)`: Abortar ante patrones de error.
+- `WithDebug()`: Habilitar logs detallados de E/S.
+- `Send / SendAndDo / SendTempl`: Enviar comandos.
+- `Expect / ExpectAndDo`: Esperar salida específica.
+- `Enable(password)`: Ayudante para modo privilegiado Cisco.
+- `SendInitial / ExpectInitial`: Interacción pre-login.
 
 ### TelnetSession
-
-La sesión telnet principal que maneja la conexión y ejecuta las acciones.
-
-#### Métodos Principales
-
-- `Run(host, port, user, pass)` - Ejecuta la sesión completa
-- `GetOutput()` - Obtiene la salida acumulada de la sesión
-
-## Buenas prácticas
-
-- **Gestión automática de prompts**: No es necesario esperar manualmente a que aparezca el prompt (`#`, `>`, `$`) usando `Expect("#")`, ya que la biblioteca maneja esto automáticamente. Ignorar esta recomendación puede causar errores inesperados.
-
-- **Configuración de SetEnter**: El método `SetEnter` debe configurarse únicamente una vez y siempre antes de declarar cualquier acción. Si no se especifica, el carácter por defecto es `\n`.
-
-## Configuración de Timeouts
-
-```go
-session, err := telnetsession.NewBuilder().
-    WithTimeout(10 * time.Second).        // Timeout de conexión
-    WithReadTimeout(5 * time.Second).     // Timeout de lectura
-    WithWriteTimeout(3 * time.Second).    // Timeout de escritura
-    // ... resto de configuración
-    Build()
-```
-
-## Manejo de Prompts
-
-Los prompts se utilizan para esperar respuestas del dispositivo después de enviar comandos:
-
-```go
-session, err := telnetsession.NewBuilder().
-    SetPrompt(">").           // Prompt normal
-    Send("enable").
-    SetPrompt("#").           // Prompt privilegiado
-    Send("configure terminal").
-    SetPrompt("(config)#").   // Prompt de configuración
-    Build()
-```
-
-## Callbacks de Éxito
-
-Los callbacks permiten procesar las respuestas automáticamente:
-
-```go
-session, err := telnetsession.NewBuilder().
-    SendAndDo("show interfaces", func(output string) error {
-        // Procesar la salida del comando
-        if strings.Contains(output, "up") {
-            fmt.Println("Interfaz activa encontrada")
-        }
-        return nil
-    }).
-    Build()
-```
-
-## Plantillas
-
-Las plantillas permiten generar comandos dinámicamente usando la sintaxis de Go templates:
-
-```go
-data := map[string]any{
-    "vlans": []int{10, 20, 30},
-    "name": "VLAN_",
-}
-
-session, err := telnetsession.NewBuilder().
-    SendTempl(`
-{{ range .vlans }}
-vlan {{ . }}
-name {{ $.name }}{{ . }}
-exit
-{{ end }}`, data).
-    Build()
-```
-
-## Ejemplos
-
-[Haga click aquí](/examples)
-
-## Manejo de Errores
-
-La biblioteca proporciona errores descriptivos para facilitar el debugging:
-
-```go
-if err := device.Run(host, port, user, pass); err != nil {
-    log.Printf("Error en la sesión: %v", err)
-    return
-}
-```
-
-## Requisitos
-
-- Go 1.23 o superior
+- `Run(host, port, user, pass)`: Ejecución estándar.
+- `RunWithContext(ctx, ...)`: Ejecución con soporte de cancelación.
+- `GetOutput()`: Salida limpia (sin ANSI, sin IAC, líneas colapsadas).
 
 ## Licencia
-
-Este proyecto está bajo la licencia MIT.
-
-## Contribuciones
-
-Las contribuciones son bienvenidas. Por favor, abre un issue o pull request para sugerencias o mejoras. 
+Licencia MIT.
