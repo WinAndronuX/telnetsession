@@ -1,6 +1,7 @@
 package telnetsession
 
 import (
+	"regexp"
 	"strings"
 	"text/template"
 )
@@ -25,17 +26,17 @@ type Action interface {
 	GetType() ActionType
 	// GetText returns the text associated with this action
 	GetText() (string, error)
-	// GetPrompt returns the prompt character to wait for after sending text
-	GetPrompt() string
-	// SetPrompr
-	SetPrompt(prompt string)
+	// GetPrompt returns the prompt regular expression to wait for after sending text
+	GetPrompt() *regexp.Regexp
+	// SetPrompt
+	SetPrompt(prompt *regexp.Regexp)
 	// GetOnSuccessFunc returns the callback function to execute on success
 	GetOnSuccessFunc() OnSuccessFunc
 }
 
 // ExpectAction represents an action that waits for specific text to appear in the session
 type ExpectAction struct {
-	text          string
+	pattern       *regexp.Regexp
 	OnSuccessFunc OnSuccessFunc
 }
 
@@ -46,15 +47,20 @@ func (e *ExpectAction) GetType() ActionType {
 
 // GetText returns the text to expect, always returns the text without error
 func (e *ExpectAction) GetText() (string, error) {
-	return e.text, nil
+	return e.pattern.String(), nil
 }
 
-// GetPrompt returns an empty string as ExpectAction doesn't use prompts
-func (e *ExpectAction) GetPrompt() string {
-	return ""
+// GetPattern returns the compiled regular expression for this action
+func (e *ExpectAction) GetPattern() *regexp.Regexp {
+	return e.pattern
 }
 
-func (e *ExpectAction) SetPrompt(_ string) {
+// GetPrompt returns nil as ExpectAction doesn't use prompts
+func (e *ExpectAction) GetPrompt() *regexp.Regexp {
+	return nil
+}
+
+func (e *ExpectAction) SetPrompt(_ *regexp.Regexp) {
 
 }
 
@@ -66,7 +72,7 @@ func (e *ExpectAction) GetOnSuccessFunc() OnSuccessFunc {
 // SendAction represents an action that sends templated text to the remote device
 type SendAction struct {
 	templ         *template.Template
-	prompt        string
+	prompt        *regexp.Regexp
 	data          map[string]any
 	onSuccessFunc OnSuccessFunc
 }
@@ -86,12 +92,12 @@ func (s *SendAction) GetText() (string, error) {
 	return result.String(), nil
 }
 
-// GetPrompt returns the prompt character to wait for after sending text
-func (s *SendAction) GetPrompt() string {
+// GetPrompt returns the prompt regular expression to wait for after sending text
+func (s *SendAction) GetPrompt() *regexp.Regexp {
 	return s.prompt
 }
 
-func (s *SendAction) SetPrompt(prompt string) {
+func (s *SendAction) SetPrompt(prompt *regexp.Regexp) {
 	s.prompt = prompt
 }
 

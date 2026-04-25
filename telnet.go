@@ -2,40 +2,51 @@ package telnetsession
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"fmt"
 	"net"
+	"regexp"
 	"strings"
 	"time"
 )
 
 // TelnetSession manages a telnet connection and executes session actions
 type TelnetSession struct {
-	conn    net.Conn
-	reader  *bufio.Reader
-	session *Session
-	output  strings.Builder
+	conn       net.Conn
+	reader     *bufio.Reader
+	session    *Session
+	output     bytes.Buffer
+	ctx        context.Context
+	state      State
+	moreBuffer bytes.Buffer
 }
 
 // New creates a new TelnetSession with the provided session configuration
 func New(session *Session) *TelnetSession {
-	return &TelnetSession{session: session}
+	return &TelnetSession{
+		session: session,
+		ctx:     context.Background(),
+		state:   StateDisconnected,
+	}
 }
 
-// GetOutput returns the accumulated output from the session, with duplicate empty lines removed
+// transition updates the current state of the session
+func (t *TelnetSession) transition(s State) {
+	t.state = s
+}
+
+// GetOutput returns the accumulated output from the session, with ANSI codes and duplicate empty lines removed
 func (t *TelnetSession) GetOutput() string {
 	output := t.output.String()
 
-	// Replace multiple consecutive Enter characters with single Enter
-	// Use a simple loop to replace all occurrences
-	for {
-		newOutput := strings.ReplaceAll(output, t.session.Enter+t.session.Enter, t.session.Enter)
-		if newOutput == output {
-			break
-		}
-		output = newOutput
-	}
+	// 1. Remove ANSI escape codes (colors, cursor movements, etc.)
+	ansi := regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]`)
+	output = ansi.ReplaceAllString(output, "")
 
-	return output
+	// 2. Replace multiple consecutive Enter characters with single Enter
+	re := regexp.MustCompile(fmt.Sprintf("(%s){2,}", regexp.QuoteMeta(t.session.Enter)))
+	return re.ReplaceAllString(output, t.session.Enter)
 }
 
 // setReadDeadline sets a deadline for read operations if timeout is configured
@@ -44,9 +55,23 @@ func (t *TelnetSession) setReadDeadline() error {
 	if timeout == 0 {
 		timeout = t.session.Timeout
 	}
+
+	deadline := time.Time{}
 	if timeout > 0 {
-		deadline := time.Now().Add(timeout)
-		return t.conn.SetReadDeadline(deadline)
+		deadline = time.Now().Add(timeout)
+	}
+
+	// Check if context has a shorter deadline
+	if ctxDeadline, ok := t.ctx.Deadline(); ok {
+		if deadline.IsZero() || ctxDeadline.Before(deadline) {
+			deadline = ctxDeadline
+		}
+	}
+
+	if !deadline.IsZero() {
+		if err := t.conn.SetReadDeadline(deadline); err != nil {
+			return fmt.Errorf("failed to set read deadline: %w", err)
+		}
 	}
 	return nil
 }
@@ -57,18 +82,35 @@ func (t *TelnetSession) setWriteDeadline() error {
 	if timeout == 0 {
 		timeout = t.session.Timeout
 	}
+
+	deadline := time.Time{}
 	if timeout > 0 {
-		deadline := time.Now().Add(timeout)
-		return t.conn.SetWriteDeadline(deadline)
+		deadline = time.Now().Add(timeout)
+	}
+
+	// Check if context has a shorter deadline
+	if ctxDeadline, ok := t.ctx.Deadline(); ok {
+		if deadline.IsZero() || ctxDeadline.Before(deadline) {
+			deadline = ctxDeadline
+		}
+	}
+
+	if !deadline.IsZero() {
+		if err := t.conn.SetWriteDeadline(deadline); err != nil {
+			return fmt.Errorf("failed to set write deadline: %w", err)
+		}
 	}
 	return nil
 }
 
 // send writes a message to the remote device and flushes the input buffer
 func (t *TelnetSession) send(msg string) error {
+	if t.session.Debug {
+		fmt.Printf(">>> SEND: %q\n", msg)
+	}
 	// Set write deadline for this operation
 	if err := t.setWriteDeadline(); err != nil {
-		return fmt.Errorf("failed to set write deadline: %w", err)
+		return err
 	}
 
 	// Discard any buffered input before sending
@@ -80,113 +122,207 @@ func (t *TelnetSession) send(msg string) error {
 	// Send the message with the configured line ending
 	_, err := t.conn.Write([]byte(msg + t.session.Enter))
 	if err != nil {
-		return fmt.Errorf("failed to send message: %w", err)
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			return fmt.Errorf("%w: %w", ErrTimeout, err)
+		}
+		return fmt.Errorf("%w: %w", ErrWriteFailed, err)
 	}
 
 	return nil
 }
 
-// expect reads from the connection until the specified character is encountered
-func (t *TelnetSession) expect(c byte) (string, error) {
-	var response strings.Builder
-
-	// Set read deadline for this operation
-	if err := t.setReadDeadline(); err != nil {
-		return "", fmt.Errorf("failed to set read deadline: %w", err)
-	}
-
+// readByte handles Telnet IAC (Interpret As Command) sequences and Auto-More detection
+func (t *TelnetSession) readByte() (byte, error) {
 	for {
 		b, err := t.reader.ReadByte()
 		if err != nil {
-			return "", fmt.Errorf("failed to read byte: %w", err)
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				return 0, fmt.Errorf("%w: %w", ErrTimeout, err)
+			}
+			return 0, fmt.Errorf("%w: %w", ErrReadFailed, err)
 		}
 
-		response.WriteByte(b)
-
-		if b == c {
-			break
+		if t.session.Debug {
+			fmt.Printf("<<< RECV: %q\n", b)
 		}
 
-		// Reset deadline for next read operation
-		if errReset := t.setReadDeadline(); errReset != nil {
-			return "", fmt.Errorf("failed to reset read deadline: %w", errReset)
+		if b == 255 {
+			// It's an IAC sequence
+			next, err := t.reader.ReadByte()
+			if err != nil {
+				return 0, fmt.Errorf("%w: %w", ErrReadFailed, err)
+			}
+
+			switch next {
+			case 255: // Escaped IAC
+				b = 255
+			case 251, 252, 253, 254: // WILL, WONT, DO, DONT
+				// Read the option byte and discard
+				_, err = t.reader.ReadByte()
+				if err != nil {
+					return 0, fmt.Errorf("%w: %w", ErrReadFailed, err)
+				}
+				// We could respond here if we wanted to negotiate,
+				// but for now we just ignore and continue reading
+				continue
+			case 250: // SB (Subnegotiation)
+				// Read until SE (240)
+				for {
+					bSub, err := t.reader.ReadByte()
+					if err != nil {
+						return 0, fmt.Errorf("%w: %w", ErrReadFailed, err)
+					}
+					if bSub == 240 {
+						break
+					}
+				}
+				continue
+			default:
+				// Other 2-byte commands
+				continue
+			}
 		}
+
+		// Pagination and Error detection (using a sliding window in moreBuffer)
+		if t.session.MorePattern != nil || len(t.session.ErrorPatterns) > 0 {
+			t.moreBuffer.WriteByte(b)
+			// Limit moreBuffer size to 256 bytes to cover longer error messages
+			if t.moreBuffer.Len() > 256 {
+				t.moreBuffer.Next(1)
+			}
+
+			// 1. Check for Error Patterns first (High priority)
+			for _, errPattern := range t.session.ErrorPatterns {
+				if errPattern.Match(t.moreBuffer.Bytes()) {
+					t.transition(StateErrorDetected)
+					return 0, fmt.Errorf("%w: %s", ErrDetectedError, errPattern.String())
+				}
+			}
+
+			// 2. Check for Pagination (Auto-More)
+			if t.session.MorePattern != nil && t.session.MorePattern.Match(t.moreBuffer.Bytes()) {
+				// Set write deadline for the response
+				if errWriteTimeout := t.setWriteDeadline(); errWriteTimeout == nil {
+					// Send the response directly to connection
+					if _, errWrite := t.conn.Write([]byte(t.session.MoreResponse)); errWrite != nil {
+						return 0, fmt.Errorf("failed to send pagination response: %w", errWrite)
+					}
+					// Clear the buffer so we don't match again immediately
+					t.moreBuffer.Reset()
+				}
+			}
+		}
+
+		return b, nil
 	}
-
-	result := response.String()
-	t.output.WriteString(result)
-
-	return result, nil
 }
 
-// expectString reads from the connection until the specified string is found
-func (t *TelnetSession) expectString(s string) (string, error) {
-	var response strings.Builder
+// expectRegex reads from the connection until the specified regular expression matches the accumulated output
+func (t *TelnetSession) expectRegex(re *regexp.Regexp) (string, error) {
+	var response bytes.Buffer
+
+	if re == nil {
+		return "", fmt.Errorf("regular expression cannot be nil")
+	}
 
 	// Set read deadline for this operation
 	if err := t.setReadDeadline(); err != nil {
-		return "", fmt.Errorf("failed to set read deadline: %w", err)
+		return "", err
 	}
 
 	for {
-		b, err := t.reader.ReadByte()
+		b, err := t.readByte()
 		if err != nil {
-			return "", fmt.Errorf("failed to read byte: %w", err)
+			return "", err
 		}
 
 		response.WriteByte(b)
 
-		if strings.Contains(response.String(), s) {
+		if re.Match(response.Bytes()) {
 			break
 		}
 
 		// Reset deadline for next read operation
 		if errReset := t.setReadDeadline(); errReset != nil {
-			return "", fmt.Errorf("failed to reset read deadline: %w", errReset)
+			return "", errReset
 		}
 	}
 
-	result := response.String()
-	t.output.WriteString(result)
+	result := response.Bytes()
+	t.output.Write(result)
 
-	return result, nil
+	return string(result), nil
 }
 
 // Run establishes a telnet connection and executes the configured session actions
 func (t *TelnetSession) Run(host string, port int, user, pass string) error {
+	return t.RunWithContext(context.Background(), host, port, user, pass)
+}
+
+// RunWithContext establishes a telnet connection and executes actions with a context
+func (t *TelnetSession) RunWithContext(ctx context.Context, host string, port int, user, pass string) error {
+	t.ctx = ctx
+	t.transition(StateConnecting)
+
 	// Validate input parameters
 	if host == "" {
-		return fmt.Errorf("host cannot be empty")
+		t.transition(StateError)
+		return ErrHostEmpty
 	}
 	if port <= 0 || port > 65535 {
-		return fmt.Errorf("port must be between 1 and 65535, got %d", port)
+		t.transition(StateError)
+		return fmt.Errorf("%w: got %d", ErrInvalidPort, port)
 	}
 
 	// Establish connection with timeout if configured
 	var err error
+	dialer := net.Dialer{}
 	if t.session.Timeout > 0 {
-		t.conn, err = net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), t.session.Timeout)
-	} else {
-		t.conn, err = net.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
-	}
-	if err != nil {
-		return fmt.Errorf("failed to connect to %s:%d: %w", host, port, err)
+		dialer.Timeout = t.session.Timeout
 	}
 
-	defer func(conn net.Conn) { _ = conn.Close() }(t.conn)
+	t.conn, err = dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", host, port))
+	if err != nil {
+		t.transition(StateError)
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			return fmt.Errorf("%w: %w", ErrTimeout, err)
+		}
+		return fmt.Errorf("%w: %w", ErrConnectionFailed, err)
+	}
+
+	defer func() {
+		_ = t.conn.Close()
+		if t.state != StateError && t.state != StateErrorDetected {
+			t.transition(StateClosed)
+		}
+	}()
 
 	t.reader = bufio.NewReader(t.conn)
 
-	// Handle login if credentials are provided
-	if user != "" && pass != "" {
-		if errLogin := t.handleLogin(user, pass); errLogin != nil {
-			return fmt.Errorf("login failed: %w", errLogin)
+	// Execute Initial Actions (Pre-login, e.g., for Nokia TL1)
+	for i, action := range t.session.InitialActions {
+		t.transition(StateExecuting)
+		if err := t.executeAction(action); err != nil {
+			t.transition(StateError)
+			return fmt.Errorf("initial action %d failed: %w", i+1, err)
 		}
 	}
 
+	// Handle login if credentials are provided
+	if user != "" && pass != "" {
+		t.transition(StateAuthenticating)
+		if errLogin := t.handleLogin(user, pass); errLogin != nil {
+			t.transition(StateError)
+			return fmt.Errorf("%w: %w", ErrLoginFailed, errLogin)
+		}
+	}
+
+	t.transition(StateReady)
+
 	// Execute all configured actions
 	if errExecActions := t.executeActions(); errExecActions != nil {
-		return fmt.Errorf("failed to execute actions: %w", errExecActions)
+		t.transition(StateError)
+		return fmt.Errorf("%w: %w", ErrActionFailed, errExecActions)
 	}
 
 	return nil
@@ -195,8 +331,10 @@ func (t *TelnetSession) Run(host string, port int, user, pass string) error {
 // handleLogin performs the login sequence with username and password
 func (t *TelnetSession) handleLogin(user, pass string) error {
 	// Wait for username prompt
-	if _, err := t.expectString(t.session.ExprUser); err != nil {
-		return fmt.Errorf("failed to wait for username prompt: %w", err)
+	if t.session.ExprUser != nil {
+		if _, err := t.expectRegex(t.session.ExprUser); err != nil {
+			return fmt.Errorf("failed to wait for username prompt: %w", err)
+		}
 	}
 
 	// Send username
@@ -205,13 +343,22 @@ func (t *TelnetSession) handleLogin(user, pass string) error {
 	}
 
 	// Wait for password prompt
-	if _, err := t.expectString(t.session.ExprPass); err != nil {
-		return fmt.Errorf("failed to wait for password prompt: %w", err)
+	if t.session.ExprPass != nil {
+		if _, err := t.expectRegex(t.session.ExprPass); err != nil {
+			return fmt.Errorf("failed to wait for password prompt: %w", err)
+		}
 	}
 
 	// Send password
 	if err := t.send(pass); err != nil {
 		return fmt.Errorf("failed to send password: %w", err)
+	}
+
+	// Wait for final prompt after login if configured
+	if t.session.Prompt != nil {
+		if _, err := t.expectRegex(t.session.Prompt); err != nil {
+			return fmt.Errorf("failed to wait for prompt after login: %w", err)
+		}
 	}
 
 	return nil
@@ -220,9 +367,11 @@ func (t *TelnetSession) handleLogin(user, pass string) error {
 // executeActions runs all configured actions in sequence
 func (t *TelnetSession) executeActions() error {
 	for i, action := range t.session.Actions {
+		t.transition(StateExecuting)
 		if err := t.executeAction(action); err != nil {
 			return fmt.Errorf("action %d failed: %w", i+1, err)
 		}
+		t.transition(StateReady)
 	}
 	return nil
 }
@@ -238,7 +387,7 @@ func (t *TelnetSession) executeAction(action Action) error {
 
 	switch action.GetType() {
 	case ActionExpect:
-		return t.executeExpectAction(action, text)
+		return t.executeExpectAction(action)
 	case ActionSend:
 		return t.executeSendAction(action, text)
 	default:
@@ -247,10 +396,15 @@ func (t *TelnetSession) executeAction(action Action) error {
 }
 
 // executeExpectAction handles expect-type actions
-func (t *TelnetSession) executeExpectAction(action Action, text string) error {
-	out, err := t.expectString(text)
+func (t *TelnetSession) executeExpectAction(action Action) error {
+	expectAction, ok := action.(*ExpectAction)
+	if !ok {
+		return fmt.Errorf("action is not an ExpectAction")
+	}
+
+	out, err := t.expectRegex(expectAction.GetPattern())
 	if err != nil {
-		return fmt.Errorf("failed to expect text '%s': %w", text, err)
+		return fmt.Errorf("failed to expect pattern '%s': %w", expectAction.GetPattern().String(), err)
 	}
 
 	if fn := action.GetOnSuccessFunc(); fn != nil {
@@ -276,10 +430,10 @@ func (t *TelnetSession) executeSendAction(action Action, text string) error {
 		}
 
 		prompt := action.GetPrompt()
-		if prompt != "" {
-			out, err := t.expect(prompt[0])
+		if prompt != nil {
+			out, err := t.expectRegex(prompt)
 			if err != nil {
-				return fmt.Errorf("failed to wait for prompt '%s': %w", prompt, err)
+				return fmt.Errorf("failed to wait for prompt '%s': %w", prompt.String(), err)
 			}
 			result.WriteString(out)
 		}

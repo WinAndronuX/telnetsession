@@ -1,6 +1,7 @@
 package telnetsession
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 	"text/template"
@@ -32,8 +33,8 @@ func TestSessionBuilder(t *testing.T) {
 		t.Errorf("Expected enter \\n, got %q", session.Enter)
 	}
 
-	if session.Prompt != ">" {
-		t.Errorf("Expected prompt >, got %q", session.Prompt)
+	if session.Prompt.String() != ">" {
+		t.Errorf("Expected prompt >, got %q", session.Prompt.String())
 	}
 
 	if len(session.Actions) != 2 {
@@ -43,13 +44,13 @@ func TestSessionBuilder(t *testing.T) {
 
 func TestActionTypes(t *testing.T) {
 	// Test ExpectAction
-	expectAction := &ExpectAction{text: "test", OnSuccessFunc: nil}
+	expectAction := &ExpectAction{pattern: regexp.MustCompile("test"), OnSuccessFunc: nil}
 	if expectAction.GetType() != ActionExpect {
 		t.Errorf("Expected ActionExpect, got %v", expectAction.GetType())
 	}
 
 	// Test SendAction
-	sendAction := &SendAction{templ: nil, data: nil, prompt: ">", onSuccessFunc: nil}
+	sendAction := &SendAction{templ: nil, data: nil, prompt: regexp.MustCompile(">"), onSuccessFunc: nil}
 	if sendAction.GetType() != ActionSend {
 		t.Errorf("Expected ActionSend, got %v", sendAction.GetType())
 	}
@@ -65,7 +66,7 @@ func TestSendActionTemplate(t *testing.T) {
 	sendAction := &SendAction{
 		templ:         templ,
 		data:          data,
-		prompt:        ">",
+		prompt:        regexp.MustCompile(">"),
 		onSuccessFunc: nil,
 	}
 

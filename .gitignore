@@ -1,2 +1,4 @@
 .idea
 .vscode
+clab-*/
+.clab.yml.bak

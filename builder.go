@@ -2,6 +2,7 @@ package telnetsession
 
 import (
 	"errors"
+	"regexp"
 	"text/template"
 	"time"
 )
@@ -10,18 +11,75 @@ import (
 type SessionBuilder struct {
 	actions      []Action
 	enter        string
-	prompt       string
-	exprUser     string
-	exprPass     string
+	prompt       *regexp.Regexp
+	exprUser     *regexp.Regexp
+	exprPass     *regexp.Regexp
 	timeout      time.Duration
 	readTimeout  time.Duration
 	writeTimeout time.Duration
+	morePattern  *regexp.Regexp
+	moreResponse string
+	errorPatterns []*regexp.Regexp
+	initialActions []Action
+	debug        bool
 	errors       []error
 }
 
 // NewBuilder creates a new SessionBuilder instance with default settings
 func NewBuilder() *SessionBuilder {
-	return &SessionBuilder{timeout: 0, readTimeout: 0, writeTimeout: 0, enter: "\n"}
+	return &SessionBuilder{timeout: 0, readTimeout: 0, writeTimeout: 0, enter: "\n", debug: false}
+}
+
+// WithDebug enables verbose logging for the session
+func (s *SessionBuilder) WithDebug() *SessionBuilder {
+	s.debug = true
+	return s
+}
+
+// WithErrors adds regular expression patterns that, if found in the device output, will abort the session
+func (s *SessionBuilder) WithErrors(patterns ...string) *SessionBuilder {
+	for _, p := range patterns {
+		re, err := regexp.Compile(p)
+		if err != nil {
+			s.errors = append(s.errors, err)
+			continue
+		}
+		s.errorPatterns = append(s.errorPatterns, re)
+	}
+	return s
+}
+
+// SendInitial adds an action to be executed immediately after connecting, before login
+func (s *SessionBuilder) SendInitial(text string) *SessionBuilder {
+	templ, err := template.New("").Parse(text)
+	if err != nil {
+		s.errors = append(s.errors, err)
+	}
+	s.initialActions = append(s.initialActions, &SendAction{templ: templ, data: nil, prompt: nil, onSuccessFunc: nil})
+	return s
+}
+
+// ExpectInitial adds an action to wait for a pattern before the login process starts
+func (s *SessionBuilder) ExpectInitial(pattern string) *SessionBuilder {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		s.errors = append(s.errors, err)
+		return s
+	}
+	s.initialActions = append(s.initialActions, &ExpectAction{pattern: re, OnSuccessFunc: nil})
+	return s
+}
+
+// WithPagination sets a regular expression to detect pagination prompts and the response to send
+func (s *SessionBuilder) WithPagination(pattern, response string) *SessionBuilder {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		s.errors = append(s.errors, err)
+		return s
+	}
+	s.morePattern = re
+	s.moreResponse = response
+	return s
 }
 
 // WithTimeout sets the connection timeout for the session
@@ -48,28 +106,76 @@ func (s *SessionBuilder) SetEnter(enter string) *SessionBuilder {
 	return s
 }
 
-// SetPrompt sets the prompt character to wait for after sending commands
+// SetPrompt sets the prompt regular expression to wait for after sending commands
 func (s *SessionBuilder) SetPrompt(value string) *SessionBuilder {
-	s.prompt = value
+	re, err := regexp.Compile(value)
+	if err != nil {
+		s.errors = append(s.errors, err)
+		return s
+	}
+	s.prompt = re
 	return s
 }
 
-// SetLoginExpr sets the text patterns to expect for username and password prompts
+// SetLoginExpr sets the regular expression patterns to expect for username and password prompts
 func (s *SessionBuilder) SetLoginExpr(username, password string) *SessionBuilder {
-	s.exprUser = username
-	s.exprPass = password
+	reUser, errUser := regexp.Compile(username)
+	if errUser != nil {
+		s.errors = append(s.errors, errUser)
+	} else {
+		s.exprUser = reUser
+	}
+
+	rePass, errPass := regexp.Compile(password)
+	if errPass != nil {
+		s.errors = append(s.errors, errPass)
+	} else {
+		s.exprPass = rePass
+	}
+
 	return s
 }
 
-// Expect adds an action that waits for the specified text to appear
-func (s *SessionBuilder) Expect(text string) *SessionBuilder {
-	s.actions = append(s.actions, &ExpectAction{text: text, OnSuccessFunc: nil})
+// Expect adds an action that waits for the specified regular expression to appear
+func (s *SessionBuilder) Expect(pattern string) *SessionBuilder {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		s.errors = append(s.errors, err)
+		return s
+	}
+	s.actions = append(s.actions, &ExpectAction{pattern: re, OnSuccessFunc: nil})
 	return s
 }
 
-// ExpectAndDo adds an action that waits for the specified text and executes a callback on success
-func (s *SessionBuilder) ExpectAndDo(text string, onSuccess OnSuccessFunc) *SessionBuilder {
-	s.actions = append(s.actions, &ExpectAction{text: text, OnSuccessFunc: onSuccess})
+// ExpectAndDo adds an action that waits for the specified regular expression and executes a callback on success
+func (s *SessionBuilder) ExpectAndDo(pattern string, onSuccess OnSuccessFunc) *SessionBuilder {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		s.errors = append(s.errors, err)
+		return s
+	}
+	s.actions = append(s.actions, &ExpectAction{pattern: re, OnSuccessFunc: onSuccess})
+	return s
+}
+
+// Enable adds actions to enter privileged EXEC mode (Cisco-style)
+func (s *SessionBuilder) Enable(password string, challengePattern ...string) *SessionBuilder {
+	pattern := "Password:"
+	if len(challengePattern) > 0 {
+		pattern = challengePattern[0]
+	}
+
+	// 1. Enviar comando enable sin esperar prompt (porque el prompt NO vendrá, vendrá el reto)
+	cmdTempl, _ := template.New("").Parse("enable")
+	s.actions = append(s.actions, &SendAction{templ: cmdTempl, data: nil, prompt: nil, onSuccessFunc: nil})
+
+	// 2. Esperar el reto de password (usualmente "Password:")
+	s.Expect(pattern)
+
+	// 3. Enviar la contraseña.
+	passTempl, _ := template.New("").Parse(password)
+	s.actions = append(s.actions, &SendAction{templ: passTempl, data: nil, prompt: nil, onSuccessFunc: nil})
+
 	return s
 }
 
@@ -117,14 +223,19 @@ func (s *SessionBuilder) SendTemplAndDo(text string, data map[string]any, onSucc
 	return s
 }
 
-func (s *SessionBuilder) Confirm(prompt, message string) *SessionBuilder {
-
+func (s *SessionBuilder) Confirm(promptPattern, message string) *SessionBuilder {
 	if len(s.actions) == 0 || s.actions[len(s.actions)-1].GetType() != ActionSend {
 		s.errors = append(s.errors, errors.New("confirm action requires a pre send action"))
 		return s
 	}
 
-	s.actions[len(s.actions)-1].SetPrompt(prompt)
+	rePrompt, errPrompt := regexp.Compile(promptPattern)
+	if errPrompt != nil {
+		s.errors = append(s.errors, errPrompt)
+		return s
+	}
+
+	s.actions[len(s.actions)-1].SetPrompt(rePrompt)
 
 	templ, err := template.New("").Parse(message)
 	if err != nil {
@@ -137,7 +248,7 @@ func (s *SessionBuilder) Confirm(prompt, message string) *SessionBuilder {
 }
 
 // Build creates a Session instance from the builder configuration
-// Returns an error if any template parsing errors occurred during building
+// Returns an error if any template parsing or regex compilation errors occurred during building
 func (s *SessionBuilder) Build() (*Session, error) {
 	if len(s.errors) > 0 {
 		return nil, errors.Join(s.errors...)
@@ -152,5 +263,10 @@ func (s *SessionBuilder) Build() (*Session, error) {
 		Timeout:      s.timeout,
 		ReadTimeout:  s.readTimeout,
 		WriteTimeout: s.writeTimeout,
+		MorePattern:  s.morePattern,
+		MoreResponse: s.moreResponse,
+		ErrorPatterns: s.errorPatterns,
+		InitialActions: s.initialActions,
+		Debug:        s.debug,
 	}, nil
 }
