@@ -112,5 +112,20 @@ session, _ := builder.
 - `RunWithContext(ctx, ...)`: Execution with cancellation support.
 - `GetOutput()`: Cleaned output (no ANSI, no IAC, collapsed lines).
 
+### Pool
+- `NewPool()`: Creates a new pool with automatic idle cleanup.
+- `Do(ctx, session, host, port, user, pass)`: Executes a session with exclusive access per device.
+- `GetActiveSession(host, port)`: Retrieve an ongoing session instance.
+- `CountActiveSessions()`: Get total number of concurrent sessions.
+
+## License
+MIT License.
+ction.
+
+### TelnetSession
+- `Run(host, port, user, pass)`: Standard execution.
+- `RunWithContext(ctx, ...)`: Execution with cancellation support.
+- `GetOutput()`: Cleaned output (no ANSI, no IAC, collapsed lines).
+
 ## License
 MIT License.

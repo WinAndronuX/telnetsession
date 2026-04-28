@@ -110,5 +110,18 @@ session, _ := builder.
 - `RunWithContext(ctx, ...)`: Ejecución con soporte de cancelación.
 - `GetOutput()`: Salida limpia (sin ANSI, sin IAC, líneas colapsadas).
 
+### Pool
+- `NewPool()`: Crea un nuevo pool con limpieza automática de inactividad.
+- `Do(ctx, session, host, port, user, pass)`: Ejecuta una sesión con acceso exclusivo por dispositivo.
+- `GetActiveSession(host, port)`: Obtener la instancia de una sesión en curso.
+- `CountActiveSessions()`: Obtener el número total de sesiones concurrentes.
+
+## Licencia
+Licencia MIT.
+etSession
+- `Run(host, port, user, pass)`: Ejecución estándar.
+- `RunWithContext(ctx, ...)`: Ejecución con soporte de cancelación.
+- `GetOutput()`: Salida limpia (sin ANSI, sin IAC, líneas colapsadas).
+
 ## Licencia
 Licencia MIT.
