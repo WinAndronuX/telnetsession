@@ -120,12 +120,3 @@ session, _ := builder.
 
 ## License
 MIT License.
-ction.
-
-### TelnetSession
-- `Run(host, port, user, pass)`: Standard execution.
-- `RunWithContext(ctx, ...)`: Execution with cancellation support.
-- `GetOutput()`: Cleaned output (no ANSI, no IAC, collapsed lines).
-
-## License
-MIT License.

@@ -118,10 +118,3 @@ session, _ := builder.
 
 ## Licencia
 Licencia MIT.
-etSession
-- `Run(host, port, user, pass)`: Ejecución estándar.
-- `RunWithContext(ctx, ...)`: Ejecución con soporte de cancelación.
-- `GetOutput()`: Salida limpia (sin ANSI, sin IAC, líneas colapsadas).
-
-## Licencia
-Licencia MIT.
